@@ -1,0 +1,75 @@
+name: "Sync Deploy Branch"
+run-name: "Sync Deploy Branch"
+
+# The weekly run replays the carried fixes onto upstream main and pushes deploy, which
+# triggers the Fork Docker Image build. CT 108 still pulls the new image by hand.
+# A rebase conflict fails the run; resolve it locally with the runbook steps.
+on:
+  schedule:
+    - cron: "0 10 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  sync:
+    if: github.repository == 'mhaslinsky/inbox-zero'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout deploy
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: deploy
+          fetch-depth: 0
+          # GITHUB_TOKEN can't push upstream's workflow file changes, and its
+          # pushes don't trigger the image build. A deploy key does both.
+          ssh-key: ${{ secrets.DEPLOY_SYNC_KEY }}
+
+      - name: Rebase onto upstream main
+        id: rebase
+        run: |
+          git config user.name "mhas"
+          git config user.email "17221433+mhaslinsky@users.noreply.github.com"
+          git fetch --no-tags https://github.com/elie222/inbox-zero.git main
+          upstream=$(git rev-parse FETCH_HEAD)
+          echo "old=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "deploy already contains upstream main ${upstream:0:9}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git rebase "$upstream"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "Rebased deploy onto upstream main ${upstream:0:9}. Carried commits:"
+            echo
+            git log --format='- %h %s' "$upstream..HEAD"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push deploy and the main mirror
+        if: steps.rebase.outputs.changed == 'true'
+        run: |
+          git push --force-with-lease=deploy:${{ steps.rebase.outputs.old }} origin HEAD:refs/heads/deploy
+          git push origin ${{ steps.rebase.outputs.upstream }}:refs/heads/main
+
+      - name: Keep upstream workflows disabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow list --all --json path,state \
+            --jq '.[] | select(.state == "active" and (.path | startswith(".github/workflows/"))) | .path' \
+            | { grep -vxE '\.github/workflows/(fork-image|sync-deploy)\.yml' || true; } \
+            | while read -r workflow; do
+                gh workflow disable "$(basename "$workflow")"
+                echo "Disabled $workflow" >> "$GITHUB_STEP_SUMMARY"
+              done
